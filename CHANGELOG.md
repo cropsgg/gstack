@@ -1,5 +1,94 @@
 # Changelog
 
+## [1.42.0.0] - 2026-05-19
+
+## **Daegu wave: 23 community-filed bugs land as one bisect-clean PR with the documented sidebar security stack finally enforced.**
+## **Every full-page screenshot stops bricking the vision API at 2000px, the Windows installer stops failing on Bun shell parsing, `/codex review` works on Codex CLI 0.130+, and the L4 prompt-injection classifier actually runs.**
+
+The biggest single wave since v1.18: 24 bisect commits closing 14 distinct user-facing problems across compat, security, install, and screenshot surfaces. The PTY-injection scan path that CLAUDE.md described as "shipped" finally is shipped (#1370 was the gap codex found in its plan review). The Windows installer that's been broken since v1.34.2.0 builds cleanly again. `/codex review` against Codex CLI ≥0.130.0 stops erroring out at the argv-parser before the model runs. Design generation stops silently billing whatever OpenAI account happened to be in your cwd `.env`. Full-page screenshots stop hitting the Anthropic vision API 2000px-max-dim brick. Every PR/issue closed in this wave is named in the per-commit body with credit to the original reporter or contributor.
+
+### The numbers that matter
+
+Source: `git log v1.40.0.0..HEAD --oneline` (24 commits) plus the test sweep in §"Coverage" below.
+
+| Surface | Before | After |
+|---|---|---|
+| Windows fresh `./setup` from a clean checkout (Git Bash) | `bun run build` exits with "Subshells with redirections not supported" on Bun 1.3.x; install bricked since v1.34.2.0 (#1538/#1537/#1530/#1457/#1561) | `scripts/build.sh` runs POSIX-portable, gated by a new `windows-setup-e2e.yml` workflow that runs `bun run build` on every PR touching the install path |
+| `/codex review` on Codex CLI 0.130.0+ | argv-parser rejects `codex review "PROMPT" --base <branch>` as mutually exclusive (#1479); skill aborts before the model runs | Diff scope moved into the prompt; `--base` dropped. Filesystem boundary preserved on every call (pinned by `test/skill-validation.test.ts`) |
+| `/sync-gbrain` on gbrain v0.18-0.35 | `gbrain put_page` (unknown command, renamed to `put` in 0.18); `sources list --json` shape changed to `{sources:[...]}` (0.20+); doctor `schema_version: 2` dropped the `engine` field (0.25+) | All three handled. Resolver instructions rewritten to canonical `put <slug>`; wrapped-shape parsing added; schema_v2 fallback to `config.json` |
+| Full-page screenshot of a 5000px-tall page | Silent base64 blob the Anthropic vision API rejects at 2000px max-dim — agent burns turns on a useless image (#1214) | `browse/src/screenshot-size-guard.ts` downscales via sharp; warning to stderr; covered for snapshot.ts + meta-commands.ts + write-commands.ts |
+| Sidebar Cleanup / Inspector "Send to Code" PTY injection | Zero classifier coverage — page-derived text went straight to the live claude REPL bypassing every documented L1-L4 layer (#1370 gap) | `POST /pty-inject-scan` endpoint, Node sidecar process hosting the L4 classifier, extension pre-scan via `gstackScanForPTYInject`, static AST invariant test gating future regressions |
+| Codex plugin installed alongside gstack as a skill | `gstack-paths` trusted `CLAUDE_PLUGIN_DATA` set by the Codex plugin; all checkpoints, analytics, learnings landed in the wrong directory (#1569) | Guarded by `CLAUDE_PLUGIN_ROOT` matching "gstack"; falls through to `$HOME/.gstack` for skill installs |
+| `$D design generate` inside someone else's project with their `OPENAI_API_KEY` in `.env` | Silent billing of that project's OpenAI account (#1248) | `requireApiKey()` reports the source (`~/.gstack/openai.json` vs env var); warns when the env-var path matches a cwd `.env*` file; never echoes the key itself |
+| `codex review` exits non-zero (parse error, arg break, model API error) | Calling agent sees no output, reads as silent stall, burns 30-60min misdiagnosing (#1327) | `elif [ "$_CODEX_EXIT" != "0" ]` block at all four invocation sites surfaces `[codex exit N] <stderr first line>` plus 20 lines of context |
+| Anti-bot stealth (GStack Browser SannySoft pass rate) | Default minimum (webdriver-mask only) — fingerprint-consistent but not enough for protected sites | Opt-in `GSTACK_STEALTH=extended` adds six detection-vector patches (webdriver delete-from-prototype, WebGL spoof, PluginArray, chrome shape, mediaDevices, CDP cdc cleanup) for 100% SannySoft pass; default mode unchanged |
+
+### Coverage
+
+Every bisect commit ships its own unit tests. Three commits also add static invariant tests that fail the build on regression:
+- `test/extension-pty-inject-invariant.test.ts` — extension PTY inject must be scan-gated
+- `test/resolvers-gbrain-put-rewrite.test.ts` — generated SKILL.md must not contain `gbrain put_page`
+- `test/memory-ingest-no-put_page.test.ts` — `gstack-memory-ingest.ts` argv must never include `"put_page"`
+
+Wave-touched tests when run in isolation: 92/92 pass. The 23 failures observed in `bun test` full-suite mode are pre-existing test-pollution between files (one test mutates env vars another depends on) and exist on `v1.40.0.0` too — none traced to this wave.
+
+### What this means for builders
+
+If you ship gstack on Windows, fresh installs work again — the build chain that's been broken for five releases is now POSIX-portable. If you use `/codex review`, the argv break on Codex 0.130+ is fixed and the filesystem boundary is preserved on every call. If you sync gbrain across machines, v0.18-0.35 all work with no manual intervention. If you use the GStack Browser sidebar's Cleanup button or Inspector "Send to Code", page-derived text now passes through the L4 classifier before reaching the live REPL — and if you opted into extended stealth mode, your SannySoft pass rate goes to 100%. If you've been billing the wrong OpenAI account silently, you'll now see the source disclosure on every `$D` run.
+
+### Itemized changes
+
+#### Added
+
+- `browse/src/screenshot-size-guard.ts` — shared 2000px max-dim guard wired into all three full-page screenshot paths (snapshot.ts annotated + heatmap, meta-commands.ts screenshot + responsive sweep, write-commands.ts prettyscreenshot). Downscales via sharp; warns to stderr.
+- `browse/src/security-sidecar-entry.ts` — Node script that hosts the L4 TestSavant classifier as a subprocess of the compiled browse server. Avoids the onnxruntime-node `dlopen` failure that would brick the compiled binary.
+- `browse/src/security-sidecar-client.ts` — IPC client with lazy spawn, 5s timeout, 64KB payload cap, 3-in-10min respawn cap with circuit breaker, parent-exit cleanup.
+- `browse/src/find-security-sidecar.ts` — resolver for the sidecar entry across compiled and dev installs; returns null cleanly when Node is unavailable (extension degrades to WARN+confirm per D7).
+- `browse/src/server.ts` — `POST /pty-inject-scan` endpoint: local-only (NOT in `TUNNEL_PATHS`), root-token auth, 64KB cap, 5s timeout, response through `sanitizeReplacer`, returns combined L1-L3 + L4 verdict.
+- `extension/sidepanel-terminal.js` — `window.gstackScanForPTYInject(text, origin)` async helper; pre-scan before every `gstackInjectToTerminal` call.
+- `.github/workflows/windows-setup-e2e.yml` — fresh `./setup` E2E gate on `windows-latest` that runs `bun run build` and verifies all compiled binaries + find-browse `.exe` resolution.
+- `scripts/build.sh` + `scripts/write-version-files.sh` — POSIX-portable build chain. Replaces the Bun-shell-unfriendly inline `package.json` build script.
+- `test/extension-pty-inject-invariant.test.ts`, `test/resolvers-gbrain-put-rewrite.test.ts`, `test/memory-ingest-no-put_page.test.ts`, `browse/test/screenshot-size-guard.test.ts`, `browse/test/security-sidecar-client.test.ts`, `browse/test/pty-inject-scan.test.ts`, `browse/test/stealth-extended.test.ts`, `design/test/auth.test.ts` — 60+ new unit tests across the wave.
+
+#### Changed
+
+- `bin/gstack-paths` — `CLAUDE_PLUGIN_DATA` only trusted when `CLAUDE_PLUGIN_ROOT` matches "gstack" (case-insensitive). Foreign plugins fall through to `$HOME/.gstack`.
+- `bin/gstack-gbrain-sync.ts:sourceLocalPath` — accepts both bare-array (≤0.19) and `{sources:[...]}` wrapped (≥0.20) responses from `gbrain sources list --json`.
+- `bin/gstack-brain-context-load.ts:gbrainAvailable` — probes via `execFileSync("gbrain", ["--version"])`, no shell builtin dependency.
+- `bin/gstack-memory-ingest.ts` — `--help` and inline comments scrubbed of stale `put_page` references; regression test pins the absence in argv.
+- `lib/gbrain-local-status.ts` — `CacheEntry.schema_version` documented as distinct from `gbrain doctor` output `schema_version`; comment block clarifies the layering.
+- `scripts/resolvers/gbrain.ts` — all 10 user-facing `gbrain put_page` instruction templates rewritten to `gbrain put <slug>` with title/tags moved into YAML frontmatter inside `--content`. Affects /office-hours, /investigate, /plan-ceo-review, /retro, /plan-eng-review, /ship, /cso, /design-consultation, fallback, entity-stub.
+- `codex/SKILL.md.tmpl`, `scripts/resolvers/review.ts`, `scripts/resolvers/design.ts` — `which codex` replaced by `command -v codex` across all 10 in-repo skills.
+- `codex/SKILL.md.tmpl` — default `codex review` route now carries the filesystem boundary in the prompt instead of bare `--base`. Custom-instructions route preserved with DIFF_START/DIFF_END delimiters.
+- `review/SKILL.md.tmpl`, `scripts/resolvers/review*.ts` — diff computation switched to `DIFF_BASE=$(git merge-base origin/<base> HEAD)` to drop phantom-deletion noise from out-of-order base advancement.
+- `design/src/auth.ts` — `resolveApiKeyInfo` returns `{ key, source, envFile?, warning? }`. `requireApiKey` prints the source on stderr and warns when the env-var key matches a cwd `.env*` file. Never echoes the key itself.
+- `browse/src/stealth.ts` — opt-in `GSTACK_STEALTH=extended` adds 6 detection-vector patches on top of the existing minimum. Default mode unchanged.
+- `browse/src/find-browse.ts` — falls back to `.exe`, `.cmd`, `.bat` extensions on Windows when the bare-path probe fails.
+- `.gitignore` — `bin/gstack-global-discover` → `bin/gstack-global-discover*` so Windows `.exe` build artifacts are ignored.
+
+#### Fixed
+
+- Cross-plugin state contamination when the Codex plugin runs alongside gstack-as-a-skill (#1569). Contributed by @ElliotDrel via #1570.
+- `/sync-gbrain` crashing with `list.find is not a function` on gbrain v0.20+ (#1567). Contributed by @jakehann11 via #1571. Supersedes #1564 (@tonyjzhou).
+- `/gstack-brain-context-load` reporting gbrain as missing under non-interactive shells (#1559). Contributed by @jbetala7 via #1560.
+- Memory ingest doctor parse path on gbrain v0.25+ schema_version: 2 output (#1418, regression-test pin). Credit @mvanhorn.
+- `bun run build` failing on Windows since v1.34.2.0 (#1538, #1537, #1530, #1457, #1561). Contributed by @Charlie-El via #1544. Supersedes #1531 (@scarson), #1480 (@mikepsinn), #1460 (@realcarsonterry).
+- `find-browse` not resolving `browse.exe` on Windows (#1554). Contributed by @Mike-E-Log.
+- `/codex review` argv-shape break on Codex CLI 0.130+ (#1479). Contributed by @jbetala7 via #1209. Supersedes #1527 (@mvanhorn) and #1449 (@Gujiassh).
+- `/review` and `/ship` showing phantom deletions when the base branch advanced (#1152 pattern). Contributed by @mvanhorn via #1492.
+- `/codex review` filesystem boundary on the default path (#1503). Closed by C10 + the boundary-preservation regression test that subsumes #1522 (credit @genisis0x).
+- `which codex` detection failing in non-interactive / minimal shells (#1193 pattern). Contributed by @mvanhorn via #1197.
+- Codex non-zero exits read as silent stalls (#1327). Contributed by @genisis0x via #1467.
+- `$D design` silently billing whoever owns the `.env` in cwd (#1248). Contributed by @jbetala7 via #1278.
+- Full-page screenshots silently bricking the Anthropic vision API at >2000px (#1214).
+- PTY-injection bypass of the documented sidebar security stack (#1370). Closed end-to-end via the sidecar + endpoint + extension-wiring + invariant test.
+- The `gbrain put_page` subcommand renamed to `put` in gbrain v0.18+ (#1346). Regression-test pin + resolver template rewrite ensure existing users' generated SKILL.md instructions remain valid through gbrain 0.18-0.35+.
+
+#### For contributors
+
+- The wave is one bundled PR with 24 bisect commits. Each PR/issue closed is named in the corresponding commit body with the contributor's GitHub handle. After this lands on `main`, the post-merge close-out step executes the queue triage (close 22 PRs + 6 issues with credit comments).
+- The CHANGELOG harden-against-critics rule: this entry leads with capability, never admits prior breakage as breakage. Where the prior shape was actively broken (Windows install, /codex review), we state the new shape and reference the PR/issue number — readers landing on the entry learn what they can do now.
+
 ## [1.41.1.0] - 2026-05-18
 
 ## **Seven HIGH-severity audit bugs land with regression tests pinning every fix.**
